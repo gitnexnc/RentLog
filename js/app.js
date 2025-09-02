@@ -3,53 +3,72 @@
 import * as ui from './ui.js';
 import * as fileManager from './filemanager.js';
 
-const state = {
+let state = {
+    version: 1,
     properties: [],
     tenants: [],
 };
 
+let currentView = {
+    page: 'dashboard',
+    tenantId: null,
+};
+
+
 // --- Initial Setup ---
 function init() {
-    document.getElementById('open-file-btn').addEventListener('click', handleOpenFile);
-    document.getElementById('create-file-btn').addEventListener('click', handleCreateFile);
-    fileManager.configureInterface(); // Adjust UI elements for legacy browsers
+    // Decouple event binding: app.js tells fileManager to set up its own buttons
+    // and provides the functions to call when actions happen.
+    fileManager.setupFileHandlers({
+        onFileOpened: handleFileOpened,
+        onCreateNew: handleCreateFile
+    });
 }
 
-async function handleOpenFile() {
-    const data = await fileManager.openFile();
-    if (data && data.properties && data.tenants) {
-        Object.assign(state, data);
-        startApp();
-    } else if (data) {
-        // This case handles a file that is valid JSON but not a valid rentlog file
-        alert("Invalid data file. Please select a valid RentLog JSON file or create a new one.");
+// Renamed from handleOpenFile to avoid confusion
+function handleFileOpened(fileResult) {
+    if (fileResult.data && fileResult.data.properties && fileResult.data.tenants) {
+        state = fileResult.data;
+        // Ensure new data structures exist for older files (backward compatibility)
+        state.tenants.forEach(t => {
+            if (!t.bills) t.bills = [];
+            if (!t.payments) t.payments = [];
+        });
+        startApp(fileResult.name);
+    } else {
+        ui.showAlert({ title: "Invalid File", message: "The selected file is not a valid RentLog JSON file. Please choose another file or create a new one." });
     }
-    // If data is null (meaning the user cancelled the file picker), we simply do nothing.
 }
 
-// *** This function now immediately starts the app with a default state. ***
-// This provides a much better user experience than forcing a save immediately.
-function handleCreateFile() {
+async function handleCreateFile() {
     const defaultState = {
+        version: 1,
         properties: [{id: Date.now(), name: "My First Property", address: "123 Example St"}],
         tenants: [],
     };
     
-    Object.assign(state, defaultState);
-    startApp();
+    // First, prompt user to save the new file.
+    const { success, name } = await fileManager.saveFileAs(defaultState);
+
+    // Only start the app if the file was successfully saved.
+    if (success) {
+        state = defaultState;
+        startApp(name);
+    }
 }
 
-function startApp() {
-    // We don't need to directly manipulate the fileHandle from here anymore.
-    // The fileManager will correctly handle if it's null or not.
+function startApp(fileName) {
     document.getElementById('loader-screen').classList.add('hidden');
     document.getElementById('app-container').classList.remove('hidden');
+    document.getElementById('file-name-display').textContent = fileName;
+    
     bindAppEvents();
     renderAll();
     navigateTo('dashboard');
 }
 
-// --- Application Logic ---
+
+// --- Application Logic & Navigation ---
 
 function bindAppEvents() {
     document.getElementById('menu-button').addEventListener('click', () => document.getElementById('sidebar').classList.toggle('open'));
@@ -58,97 +77,172 @@ function bindAppEvents() {
     });
     
     document.getElementById('save-file-btn').addEventListener('click', async () => {
-        // Now, this button will correctly trigger a "Save As" if no file is open
-        const { success } = await fileManager.saveFile(state);
-        if (success) ui.showToast();
+        const { success, name } = await fileManager.saveFile(state);
+        if (success) {
+            ui.showToast();
+            if(name) document.getElementById('file-name-display').textContent = name;
+        }
     });
 
-    // Event delegation for dynamically created content
     document.body.addEventListener('click', (e) => {
-        const target = e.target.closest('button');
-        if (!target) return;
-        
-        // Tenant Modal
-        if (target.id === 'add-tenant-btn') handleAddTenant();
-        if (target.id === 'save-tenant-btn') saveTenant();
-        if (target.id === 'cancel-tenant-btn') ui.hideModal('tenant-modal');
+        const button = e.target.closest('button');
+        const tenantLink = e.target.closest('.tenant-link');
 
-        // Property Modal
-        if (target.matches('.edit-property-btn')) handleEditProperty(target.dataset.id);
-        if (target.id === 'save-edit-property-btn') saveProperty();
-        if (target.id === 'cancel-edit-property-btn') ui.hideModal('edit-property-modal');
+        if (tenantLink) {
+            e.preventDefault();
+            navigateTo('tenant-detail', { tenantId: parseInt(tenantLink.dataset.tenantId) });
+            return;
+        }
+        
+        if (button && button.id === 'back-to-tenants') {
+             navigateTo('tenants');
+             return;
+        }
+
+        if (!button) return;
+
+        // Modals
+        if (button.matches('#add-property-btn')) handleAddProperty();
+        if (button.matches('.edit-property-btn')) handleEditProperty(button.dataset.id);
+        if (button.matches('#save-property-btn')) saveProperty();
+        if (button.matches('.cancel-modal-btn')) ui.hideModal(button.closest('.modal').id);
+
+        if (button.matches('#add-tenant-btn')) handleAddTenant();
+        if (button.matches('#save-tenant-btn')) saveTenant();
+
+        // Tenant Detail Actions
+        if (button.matches('#add-bill-btn')) handleAddBill(button.dataset.tenantId);
+        if (button.matches('#save-bill-btn')) saveBill(button.dataset.tenantId);
+        
+        if (button.matches('#add-payment-btn')) handleAddPayment(button.dataset.tenantId);
+        if (button.matches('#save-payment-btn')) savePayment(button.dataset.tenantId);
+        if (button.matches('.delete-payment-btn')) deletePayment(button.dataset.tenantId, button.dataset.paymentId);
     });
 }
 
 function renderAll() {
-    ui.renderDashboard(state);
-    ui.renderTenantsPage(state);
-    ui.renderPropertiesPage(state);
+    // Only render the visible page to improve performance
+    const page = currentView.page;
+    if (page === 'dashboard') ui.renderDashboard(state);
+    else if (page === 'tenants') ui.renderTenantsPage(state);
+    else if (page === 'properties') ui.renderPropertiesPage(state);
+    else if (page === 'tenant-detail') ui.renderTenantDetailPage(state, currentView.tenantId);
 }
 
-function navigateTo(pageId) {
-    document.querySelectorAll('.page').forEach(page => page.classList.toggle('hidden', page.id !== pageId));
+function navigateTo(pageId, params = {}) {
+    currentView.page = pageId;
+    currentView.tenantId = params.tenantId || null;
+
+    document.querySelectorAll('.page').forEach(page => page.classList.add('hidden'));
+    document.getElementById(pageId).classList.remove('hidden');
+
     document.querySelectorAll('.nav-link').forEach(link => {
-        link.classList.toggle('bg-gray-200', link.getAttribute('href') === `#${pageId}`);
+        const linkPage = link.getAttribute('href').substring(1);
+        let isActive = (linkPage === pageId) || (pageId === 'tenant-detail' && linkPage === 'tenants');
+        link.classList.toggle('bg-gray-200', isActive);
     });
+    
+    renderAll(); // Re-render the UI for the new view
+
     if (document.getElementById('sidebar').classList.contains('open')) {
         document.getElementById('sidebar').classList.remove('open');
     }
 }
 
-// --- Tenant Actions ---
-function handleAddTenant() {
-    if (state.properties.length === 0) {
-        alert("Please add a property before adding a tenant.");
-        return;
+// --- Action Handlers ---
+
+function handleAddProperty() {
+    ui.renderPropertyModal();
+    ui.showModal('property-modal');
+}
+function handleEditProperty(propId) {
+    const property = state.properties.find(p => p.id == propId);
+    ui.renderPropertyModal(property);
+    ui.showModal('property-modal');
+}
+function saveProperty() {
+    const idInput = document.getElementById('property-id');
+    const id = idInput.value ? parseInt(idInput.value) : null;
+    const name = document.getElementById('property-name').value;
+    const address = document.getElementById('property-address').value;
+    if (!name || !address) return ui.showAlert({ title: "Missing Info", message: "Property name and address are required." });
+
+    if (id) { // Editing existing
+        const prop = state.properties.find(p => p.id === id);
+        if (prop) { prop.name = name; prop.address = address; }
+    } else { // Adding new
+        state.properties.push({ id: Date.now(), name, address });
     }
+    ui.renderPropertiesPage(state);
+    ui.hideModal('property-modal');
+}
+
+function handleAddTenant() {
+    if (state.properties.length === 0) return ui.showAlert({ title: "No Properties", message: "Please add a property before adding a tenant." });
     ui.renderTenantModal(state.properties);
     ui.showModal('tenant-modal');
 }
-
 function saveTenant() {
-    const newTenant = {
-        id: Date.now(),
-        propertyId: parseInt(document.getElementById('tenant-property').value),
-        name: document.getElementById('tenant-name').value,
-        rent: parseFloat(document.getElementById('tenant-rent').value),
-    };
-    if (!newTenant.name || !newTenant.rent) return alert('Please fill all fields.');
+    const name = document.getElementById('tenant-name').value;
+    const rent = parseFloat(document.getElementById('tenant-rent').value);
+    const propertyId = parseInt(document.getElementById('tenant-property').value);
+    const moveInDate = document.getElementById('tenant-move-in').value;
+
+    if (!name || !rent || !propertyId || !moveInDate) return ui.showAlert({ title: "Missing Info", message: "Please fill out all fields for the tenant." });
     
-    state.tenants.push(newTenant);
-    renderAll();
+    state.tenants.push({ id: Date.now(), name, rent, propertyId, moveInDate, bills: [], payments: [] });
+    ui.renderTenantsPage(state);
     ui.hideModal('tenant-modal');
 }
 
-// --- Property Actions ---
-function handleEditProperty(propertyId) {
-    const property = state.properties.find(p => p.id == propertyId);
-    if (property) {
-        ui.renderEditPropertyModal(property);
-        ui.showModal('edit-property-modal');
-    }
+function handleAddBill(tenantId) {
+    ui.renderBillModal(tenantId);
+    ui.showModal('bill-modal');
+}
+function saveBill(tenantId) {
+    const tenant = state.tenants.find(t => t.id == tenantId);
+    if (!tenant) return;
+    
+    const amount = parseFloat(document.getElementById('bill-amount').value);
+    const dueDate = document.getElementById('bill-due-date').value;
+    if (!amount || !dueDate) return ui.showAlert({ title: "Missing Info", message: "Please provide both an amount and a due date." });
+
+    tenant.bills.push({ id: Date.now(), amount, dueDate, paidOn: null });
+    renderAll();
+    ui.hideModal('bill-modal');
 }
 
-function saveProperty() {
-    const modalContent = document.querySelector('#edit-property-modal .modal-content');
-    const propertyId = parseInt(modalContent.dataset.id);
-    const property = state.properties.find(p => p.id === propertyId);
-    
-    const newName = document.getElementById('edit-property-name').value;
-    const newAddress = document.getElementById('edit-property-address').value;
-    
-    if (!newName || !newAddress) {
-        alert("Property name and address cannot be empty.");
-        return;
-    }
+function handleAddPayment(tenantId) {
+    ui.renderPaymentModal(tenantId);
+    ui.showModal('payment-modal');
+}
+function savePayment(tenantId) {
+    const tenant = state.tenants.find(t => t.id == tenantId);
+    if (!tenant) return;
 
-    if (property) {
-        property.name = newName;
-        property.address = newAddress;
-    }
-    
+    const amount = parseFloat(document.getElementById('payment-amount').value);
+    const date = document.getElementById('payment-date').value;
+    const type = document.getElementById('payment-type').value;
+    const notes = document.getElementById('payment-notes').value;
+    if (!amount || !date || !type) return ui.showAlert({ title: "Missing Info", message: "Amount, date, and type are required." });
+
+    tenant.payments.push({ id: Date.now(), amount, date, type, notes });
     renderAll();
-    ui.hideModal('edit-property-modal');
+    ui.hideModal('payment-modal');
+}
+
+function deletePayment(tenantId, paymentId) {
+    const tenant = state.tenants.find(t => t.id == tenantId);
+    if (!tenant) return;
+    
+    ui.showConfirm({
+        title: "Delete Payment?",
+        message: "Are you sure you want to permanently delete this payment record?",
+        onConfirm: () => {
+            tenant.payments = tenant.payments.filter(p => p.id != paymentId);
+            renderAll();
+        }
+    });
 }
 
 // --- App Entry Point ---
