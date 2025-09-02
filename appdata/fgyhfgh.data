@@ -1,0 +1,10 @@
+{
+  "properties": [
+    {
+      "id": 1756804125244,
+      "name": "My First Property",
+      "address": "123 Example St"
+    }
+  ],
+  "tenants": []
+}
