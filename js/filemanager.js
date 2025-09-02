@@ -1,155 +1,149 @@
-// --- Handles all interactions with the File System Access API ---
-// --- Now includes a fallback for unsupported browsers ---
+// --- Handles all interactions with the File System and file fallbacks ---
 
 let fileHandle = null;
-const isModernApiSupported = 'showOpenFilePicker' in window;
+let fileName = '';
+const isFileSystemApiSupported = 'showOpenFilePicker' in window;
 
-// --- Legacy Fallback Methods (for Firefox, Safari) ---
+function getElement(id) { return document.getElementById(id); }
+
+// --- Public API ---
 
 /**
- * Opens a file using a hidden <input type="file"> element.
+ * Configures the initial file action buttons based on browser support.
+ * This is the entry point called by app.js.
+ * @param {object} callbacks - Functions to call on user action.
+ * @param {function} callbacks.onFileOpened - Called with file data when a file is opened.
+ * @param {function} callbacks.onCreateNew - Called when the user wants to create a new file.
  */
-function openFileLegacy() {
-    return new Promise((resolve) => {
-        // We need to create this element dynamically as it might not be in the HTML
-        let importer = document.getElementById('legacy-file-importer');
-        if (!importer) {
-            importer = document.createElement('input');
-            importer.type = 'file';
-            importer.id = 'legacy-file-importer';
-            importer.style.display = 'none'; // Hide it
-            importer.accept = '.json,application/json';
-            document.body.appendChild(importer);
-        }
+export function setupFileHandlers({ onFileOpened, onCreateNew }) {
+    if (isFileSystemApiSupported) {
+        // Modern browsers: Attach listeners to existing buttons
+        getElement('open-file-btn').addEventListener('click', async () => {
+            const fileResult = await openFile();
+            if (fileResult) onFileOpened(fileResult);
+        });
+        getElement('create-file-btn').addEventListener('click', onCreateNew);
+    } else {
+        // Fallback for Firefox/Safari: Replace buttons with input/download logic
+        const container = getElement('file-actions');
+        container.innerHTML = `
+            <label class="button-primary px-6 py-3 text-lg cursor-pointer">
+                <i class="fas fa-folder-open mr-2"></i> Open File
+                <input type="file" id="file-input" class="hidden" accept=".json">
+            </label>
+            <button id="create-file-fallback-btn" class="button-secondary px-6 py-3 text-lg">
+                <i class="fas fa-plus-circle mr-2"></i>Create New
+            </button>`;
         
-        importer.onchange = () => {
-            const file = importer.files[0];
-            if (!file) {
-                resolve(null);
-                return;
-            }
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                try {
-                    const contents = JSON.parse(event.target.result);
-                    resolve(contents);
-                } catch (err) {
-                    console.error("Error parsing legacy file:", err);
-                    alert("Failed to parse the selected file. It may be corrupt.");
-                    resolve(null);
-                }
-            };
-            reader.readAsText(file);
-        };
-        importer.click();
-    });
+        getElement('file-input').addEventListener('change', async (event) => {
+            const fileResult = await openFileFallback(event);
+            if (fileResult) onFileOpened(fileResult);
+        });
+        getElement('create-file-fallback-btn').addEventListener('click', onCreateNew);
+    }
 }
 
 /**
- * Saves a file by creating a temporary download link and clicking it.
+ * Saves the provided data object. If a file handle exists, it writes to it.
+ * Otherwise, it prompts the user to save as a new file.
  * @param {object} data - The application state to save.
  */
-function saveFileLegacy(data) {
-    const dataStr = JSON.stringify(data, null, 2);
-    const blob = new Blob([dataStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'rentlog-data.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    return Promise.resolve({ success: true }); // Mimic modern API response
+export async function saveFile(data) {
+    if (isFileSystemApiSupported) {
+        if (!fileHandle) {
+            return saveFileAs(data); // Prompt to save if no file is open
+        }
+        try {
+            const writable = await fileHandle.createWritable();
+            await writable.write(JSON.stringify(data, null, 2));
+            await writable.close();
+            return { success: true };
+        } catch (err) {
+            console.error("Error saving file:", err);
+            return { success: false, error: err };
+        }
+    } else {
+        return saveFileFallback(data);
+    }
 }
 
+/**
+ * Prompts the user to "Save As" a new file.
+ * @param {object} data - The application state to save.
+ */
+export async function saveFileAs(data) {
+    const suggestedName = `rentlog-data-${new Date().toISOString().split('T')[0]}.json`;
+    if (isFileSystemApiSupported) {
+        try {
+            fileHandle = await window.showSaveFilePicker({
+                suggestedName,
+                types: [{ description: 'RentLog Data File', accept: { 'application/json': ['.json'] } }],
+            });
+            fileName = fileHandle.name;
+            // After getting the handle, call saveFile to actually write the data
+            const saveResult = await saveFile(data);
+            return { ...saveResult, name: fileName };
+        } catch (err) {
+            console.error("Error creating new file:", err);
+            return { success: false, error: err };
+        }
+    } else {
+        return saveFileFallback(data, suggestedName);
+    }
+}
 
-// --- Modern API Methods (for Chrome, Edge) ---
+// --- Internal Functions ---
 
-async function openFileModern() {
+// Modern API: Opens a file picker and reads the file.
+async function openFile() {
     try {
         [fileHandle] = await window.showOpenFilePicker({
-            types: [{
-                description: 'RentLog JSON Files',
-                accept: { 'application/json': ['.json'] },
-            }],
+            types: [{ description: 'RentLog Data Files', accept: { 'application/json': ['.json'] } }],
         });
+        fileName = fileHandle.name;
         const file = await fileHandle.getFile();
         const contents = await file.text();
-        return JSON.parse(contents);
+        return { name: fileName, data: JSON.parse(contents) };
     } catch (err) {
-        // It's normal for this to error if the user cancels, so we don't log it as a big error.
-        console.log("File open picker was cancelled.");
+        console.error("Error opening file:", err);
         return null;
     }
 }
 
-async function saveFileAsModern(data) {
-    try {
-        // *** FIX: Suggest a default filename with the correct extension ***
-        fileHandle = await window.showSaveFilePicker({
-            suggestedName: 'rentlog-data.json',
-            types: [{
-                description: 'RentLog Data File',
-                accept: { 'application/json': ['.json'] },
-            }],
-        });
-        return saveFileModern(data); // Call the regular save function now that we have a handle
-    } catch (err) {
-       console.log("File save picker was cancelled.");
-       return { success: false, error: err };
-    }
-}
-
-async function saveFileModern(data) {
-    if (!fileHandle) {
-        return saveFileAsModern(data);
-    }
-    try {
-        const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(data, null, 2));
-        await writable.close();
-        return { success: true };
-    } catch (err) {
-        console.error("Error saving file:", err);
-        return { success: false, error: err };
-    }
-}
-
-
-// --- Public-Facing Universal Functions ---
-
-export function openFile() {
-    if (isModernApiSupported) {
-        return openFileModern();
-    } else {
-        return openFileLegacy();
-    }
-}
-
-export function saveFile(data) {
-    if (isModernApiSupported) {
-        return saveFileModern(data);
-    } else {
-        // For legacy, every save is a "save as" / download.
-        return saveFileLegacy(data);
-    }
-}
-
-export function saveFileAs(data) {
-    if (isModernApiSupported) {
-        return saveFileAsModern(data);
-    } else {
-        return saveFileLegacy(data);
-    }
-}
-
-export function configureInterface() {
-    if (!isModernApiSupported) {
-        const saveBtn = document.getElementById('save-file-btn').querySelector('span');
-        if (saveBtn) {
-            saveBtn.textContent = 'Download Data File';
+// Fallback: Reads a file from a standard file input event.
+function openFileFallback(event) {
+    return new Promise((resolve) => {
+        const file = event.target.files[0];
+        if (!file) {
+            resolve(null);
+            return;
         }
-    }
+        fileName = file.name;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            try {
+                const data = JSON.parse(e.target.result);
+                resolve({ name: fileName, data });
+            } catch (err) {
+                console.error("Error parsing file:", err);
+                resolve(null); // Indicate parsing error
+            }
+        };
+        reader.readAsText(file);
+    });
+}
+
+// Fallback: Saves a file by creating a download link.
+function saveFileFallback(data, name) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name || fileName || 'rentlog-data.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return { success: true, name: a.download };
 }
 
